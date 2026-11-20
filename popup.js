@@ -76,7 +76,6 @@ runBtn.addEventListener("click", async () => {
 
   const debuggee = { tabId: tab.id };
 
-  // Подключаем настоящий системный ввод (isTrusted: true)
   try {
     await new Promise((resolve, reject) => {
       chrome.debugger.attach(debuggee, "1.3", () => {
@@ -98,12 +97,59 @@ runBtn.addEventListener("click", async () => {
     });
   });
 
+  const getBoxState = async () => {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const candidates = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
+          .filter(el => {
+            const r = el.getBoundingClientRect();
+            return el.offsetParent !== null && r.top > window.innerHeight * 0.45 && r.width > 200;
+          });
+        const box = candidates[candidates.length - 1];
+        if (!box) return { ok: false };
+
+        const boxRect = box.getBoundingClientRect();
+        const textVal = (box.value !== undefined ? box.value : box.textContent) || "";
+
+        let container = box.parentElement;
+        for (let d = 0; d < 6 && container; d++) {
+          const r = container.getBoundingClientRect();
+          if (r.width > 350 && r.height > 70) break;
+          container = container.parentElement;
+        }
+        const scope = container || document;
+
+        const btns = Array.from(scope.querySelectorAll('button, [role="button"]')).filter(b => {
+          if (b.offsetParent === null || b === box) return false;
+          const r = b.getBoundingClientRect();
+          return r.width >= 24 && r.width <= 55 && r.height >= 24 && r.height <= 55 &&
+                 r.top >= boxRect.top && r.bottom <= boxRect.bottom + 95 &&
+                 r.left > boxRect.left + boxRect.width * 0.65;
+        });
+        btns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+        const arrowBtn = btns[0];
+        const arrowRect = arrowBtn ? arrowBtn.getBoundingClientRect() : null;
+
+        return {
+          ok: true,
+          hasText: textVal.trim().length > 0,
+          boxX: Math.round(boxRect.left + 40),
+          boxY: Math.round(boxRect.top + 15),
+          btnX: arrowRect ? Math.round(arrowRect.left + arrowRect.width / 2) : null,
+          btnY: arrowRect ? Math.round(arrowRect.top + arrowRect.height / 2) : null
+        };
+      }
+    });
+    return res?.result || { ok: false };
+  };
+
   try {
     for (let i = 0; i < prompts.length; i++) {
       if (await isStopped()) break;
 
-      // 1. Вставляем текст промпта в поле и находим точные координаты поля и круглой кнопки со стрелкой
-      const [prepRes] = await chrome.scripting.executeScript({
+      // 1. Вставляем текст текущего промпта
+      await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: (text) => {
           const candidates = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
@@ -112,7 +158,7 @@ runBtn.addEventListener("click", async () => {
               return el.offsetParent !== null && r.top > window.innerHeight * 0.45 && r.width > 200;
             });
           const box = candidates[candidates.length - 1];
-          if (!box) return { ok: false };
+          if (!box) return;
 
           box.click();
           box.focus();
@@ -127,63 +173,38 @@ runBtn.addEventListener("click", async () => {
             const range = document.createRange();
             range.selectNodeContents(box);
             sel.removeAllRanges();
-            sel.addRange(range);
+            selection?.addRange(range);
             document.execCommand("insertText", false, text);
           }
-
-          const boxRect = box.getBoundingClientRect();
-          // Находим родительскую карточку нижней панели
-          let container = box.parentElement;
-          for (let d = 0; d < 6 && container; d++) {
-            const r = container.getBoundingClientRect();
-            if (r.width > 350 && r.height > 70) break;
-            container = container.parentElement;
-          }
-          const scope = container || document;
-
-          // Находим самую правую круглую кнопку со стрелкой внутри панели ввода
-          const btns = Array.from(scope.querySelectorAll('button, [role="button"]')).filter(b => {
-            if (b.offsetParent === null || b === box) return false;
-            const r = b.getBoundingClientRect();
-            return r.width >= 24 && r.width <= 55 && r.height >= 24 && r.height <= 55 &&
-                   r.top >= boxRect.top && r.bottom <= boxRect.bottom + 95 &&
-                   r.left > boxRect.left + boxRect.width * 0.65;
-          });
-          btns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
-          const arrowBtn = btns[0];
-
-          const arrowRect = arrowBtn ? arrowBtn.getBoundingClientRect() : null;
-          return {
-            ok: true,
-            boxX: Math.round(boxRect.left + 40),
-            boxY: Math.round(boxRect.top + 15),
-            btnX: arrowRect ? Math.round(arrowRect.left + arrowRect.width / 2) : null,
-            btnY: arrowRect ? Math.round(arrowRect.top + arrowRect.height / 2) : null
-          };
         },
         args: [prompts[i]]
       });
 
-      const info = prepRes?.result;
-      if (!info || !info.ok) {
-        await setStatus("Ошибка: не найдено поле ввода промпта на странице Google Flow.");
-        break;
-      }
+      await sleep(900);
 
-      await sleep(800);
+      // 2. Убеждаемся, что промпт реально ушёл (если 1-й клик только вернул фокус окну — жмём повторно)
+      for (let attempt = 0; attempt < 6; attempt++) {
+        if (await isStopped()) break;
+        const state = await getBoxState();
+        if (!state.ok) break;
+        if (!state.hasText) break; // Поле очистилось — значит, Google Flow принял промпт!
 
-      // 2. Делаем НАСТОЯЩИЙ клик мыши по круглой кнопке со стрелкой (или нажимаем настоящий Enter)
-      if (info.btnX && info.btnY) {
-        await sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.btnX, y: info.btnY });
-        await sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x: info.btnX, y: info.btnY, button: "left", clickCount: 1 });
-        await sleep(80);
-        await sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.btnX, y: info.btnY, button: "left", clickCount: 1 });
-      } else {
-        await sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x: info.boxX, y: info.boxY, button: "left", clickCount: 1 });
-        await sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.boxX, y: info.boxY, button: "left", clickCount: 1 });
-        await sleep(150);
-        await sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
-        await sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+        // Сначала фокусируем саму вкладку кликом в пустое место поля, затем кликаем по круглой стрелке
+        await sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x: state.boxX, y: state.boxY, button: "left", clickCount: 1 });
+        await sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x: state.boxX, y: state.boxY, button: "left", clickCount: 1 });
+        await sleep(250);
+
+        if (state.btnX && state.btnY) {
+          await sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: state.btnX, y: state.btnY });
+          await sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x: state.btnX, y: state.btnY, button: "left", clickCount: 1 });
+          await sleep(80);
+          await sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x: state.btnX, y: state.btnY, button: "left", clickCount: 1 });
+        } else {
+          await sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+          await sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+        }
+
+        await sleep(1200);
       }
 
       const currentNum = i + 1;
