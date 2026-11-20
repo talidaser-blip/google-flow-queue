@@ -1,1 +1,14 @@
-
+{
+  "manifest_version": 3,
+  "name": "Google Flow Auto-Queue",
+  "version": "1.0",
+  "description": "Пакетная отправка промптов в Google Flow по 5 штук с перерывом 5 минут",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://labs.google/*",
+    "https://*.google.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
