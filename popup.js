@@ -28,7 +28,11 @@ stopBtn.addEventListener("click", () => {
 
 runBtn.addEventListener("click", async () => {
   const rawText = promptsInput.value;
-  const prompts = rawText.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 3);
+  // Убираем случайные номера в начале строк вроде "1," или "2."
+  const prompts = rawText
+    .split(/\r?\n/)
+    .map(line => line.replace(/^\s*\d+\s*[,.)\-:]\s*/, "").trim())
+    .filter(line => line.length > 3);
 
   if (prompts.length === 0) {
     statusDiv.textContent = "Ошибка: вставьте хотя бы один промпт (каждый с новой строки)!";
@@ -37,7 +41,7 @@ runBtn.addEventListener("click", async () => {
 
   const batchSize = Math.max(1, parseInt(batchSizeInput.value, 10) || 5);
   const restMinutes = Math.max(1, parseInt(restMinutesInput.value, 10) || 5);
-  const genSeconds = Math.max(10, parseInt(genSecondsInput.value, 10) || 22);
+  const genSeconds = Math.max(10, parseInt(genSecondsInput.value, 10) || 25);
 
   await chrome.storage.local.set({
     flowPrompts: rawText,
@@ -71,10 +75,13 @@ runBtn.addEventListener("click", async () => {
       };
 
       const findPromptBox = () => {
-        const textareas = Array.from(document.querySelectorAll("textarea")).filter(el => el.offsetParent !== null);
-        if (textareas.length > 0) return textareas[0];
-        const editables = Array.from(document.querySelectorAll('[contenteditable="true"], [role="textbox"]')).filter(el => el.offsetParent !== null);
-        return editables[0] || null;
+        // Ищем нижнее поле ввода промпта (не верхнюю строку поиска по библиотеке)
+        const candidates = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
+          .filter(el => {
+            const r = el.getBoundingClientRect();
+            return el.offsetParent !== null && r.top > window.innerHeight * 0.45 && r.width > 200;
+          });
+        return candidates[candidates.length - 1] || null;
       };
 
       const insertPromptText = (el, text) => {
@@ -87,23 +94,24 @@ runBtn.addEventListener("click", async () => {
           el.dispatchEvent(new Event("change", { bubbles: true }));
         } else {
           document.execCommand("selectAll", false, null);
+          document.execCommand("delete", false, null);
           document.execCommand("insertText", false, text);
           el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
         }
       };
 
-      const submitPrompt = (el) => {
-        const buttons = Array.from(document.querySelectorAll("button")).filter(b => b.offsetParent !== null && !b.disabled);
-        const sendBtn = buttons.find(b => {
-          const label = (b.getAttribute("aria-label") || b.textContent || "").toLowerCase();
-          return label.includes("generate") || label.includes("create") || label.includes("send") || label.includes("создать") || label.includes("сгенерировать");
+      const findSubmitButton = (boxEl) => {
+        const boxRect = boxEl.getBoundingClientRect();
+        // Ищем кнопки внутри или вплотную к нижней панели ввода (справа внизу от текста)
+        const allButtons = Array.from(document.querySelectorAll("button")).filter(b => {
+          if (b.offsetParent === null || b.disabled) return false;
+          const r = b.getBoundingClientRect();
+          return r.top >= boxRect.top - 20 && r.bottom <= boxRect.bottom + 80 && r.left > boxRect.left + boxRect.width * 0.5;
         });
 
-        if (sendBtn) {
-          sendBtn.click();
-        } else {
-          el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-        }
+        // Приоритет: самая правая кнопка в нижней панели (круглая кнопка со стрелкой отправки)
+        allButtons.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+        return allButtons[0] || null;
       };
 
       for (let i = 0; i < promptList.length; i++) {
@@ -111,14 +119,34 @@ runBtn.addEventListener("click", async () => {
 
         const box = findPromptBox();
         if (!box) {
-          await setStatus("Ошибка: не найдено поле ввода промпта на странице Google Flow.");
+          await setStatus("Ошибка: не найдено нижнее поле ввода промпта в Google Flow.");
           await chrome.storage.local.set({ flowRunning: false });
           return;
         }
 
-        insertPromptText(box, promptList[i]);
-        await sleep(600);
-        submitPrompt(box);
+        // Ждём, если предыдущая генерация ещё блокирует отправку
+        for (let w = 0; w < 15; w++) {
+          if (await isStopped()) return;
+          insertPromptText(box, promptList[i]);
+          await sleep(400);
+          const btn = findSubmitButton(box);
+          if (btn && !btn.disabled) {
+            btn.click();
+            await sleep(500);
+            // Проверяем, очистилось ли поле ввода (значит, Flow принял запрос)
+            const currentVal = (box.value !== undefined ? box.value : box.textContent) || "";
+            if (currentVal.trim().length === 0) {
+              break;
+            }
+          }
+          // Запасной вариант — Enter
+          box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+          await sleep(1500);
+          const afterEnterVal = (box.value !== undefined ? box.value : box.textContent) || "";
+          if (afterEnterVal.trim().length === 0) {
+            break;
+          }
+        }
 
         const currentNum = i + 1;
         const isEndOfBatch = currentNum % batch === 0 && currentNum < promptList.length;
