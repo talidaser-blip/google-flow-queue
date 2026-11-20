@@ -21,14 +21,24 @@ setInterval(() => {
   });
 }, 1000);
 
-stopBtn.addEventListener("click", () => {
-  chrome.storage.local.set({ flowStop: true, flowRunning: false, flowStatus: "Остановлено пользователем." });
+stopBtn.addEventListener("click", async () => {
+  await chrome.storage.local.set({ flowStop: true, flowRunning: false, flowStatus: "Остановлено пользователем." });
   runBtn.disabled = false;
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id) {
+    chrome.debugger.detach({ tabId: tab.id }, () => void chrome.runtime.lastError);
+  }
 });
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const setStatus = (msg) => chrome.storage.local.set({ flowStatus: msg });
+const isStopped = async () => {
+  const r = await chrome.storage.local.get(["flowStop"]);
+  return Boolean(r.flowStop);
+};
 
 runBtn.addEventListener("click", async () => {
   const rawText = promptsInput.value;
-  // Убираем номера в начале строк ("1,", "2." и т.д.)
   const prompts = rawText
     .split(/\r?\n/)
     .map(line => line.replace(/^\s*\d+\s*[,.)\-:]\s*/, "").trim())
@@ -41,7 +51,7 @@ runBtn.addEventListener("click", async () => {
 
   const batchSize = Math.max(1, parseInt(batchSizeInput.value, 10) || 5);
   const restMinutes = Math.max(1, parseInt(restMinutesInput.value, 10) || 5);
-  const genSeconds = Math.max(12, parseInt(genSecondsInput.value, 10) || 25);
+  const genSeconds = Math.max(15, parseInt(genSecondsInput.value, 10) || 25);
 
   await chrome.storage.local.set({
     flowPrompts: rawText,
@@ -64,131 +74,146 @@ runBtn.addEventListener("click", async () => {
     return;
   }
 
-  chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: async (promptList, batch, restMin, genSec) => {
-      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-      const setStatus = (msg) => chrome.storage.local.set({ flowStatus: msg });
-      const isStopped = async () => {
-        const r = await chrome.storage.local.get(["flowStop"]);
-        return Boolean(r.flowStop);
-      };
+  const debuggee = { tabId: tab.id };
 
-      const findPromptBox = () => {
-        const candidates = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
-          .filter(el => {
-            const r = el.getBoundingClientRect();
-            return el.offsetParent !== null && r.top > window.innerHeight * 0.45 && r.width > 200;
-          });
-        return candidates[candidates.length - 1] || null;
-      };
+  // Подключаем настоящий системный ввод (isTrusted: true)
+  try {
+    await new Promise((resolve, reject) => {
+      chrome.debugger.attach(debuggee, "1.3", () => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve();
+      });
+    });
+  } catch (e) {
+    await setStatus("Ошибка подключения к вкладке: " + e.message);
+    await chrome.storage.local.set({ flowRunning: false });
+    runBtn.disabled = false;
+    return;
+  }
 
-      const insertPromptText = (el, text) => {
-        el.click();
-        el.focus();
-        if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
-          if (setter) setter.call(el, text);
-          else el.value = text;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        } else {
-          // Выделяем существующий текст и вставляем новый как при Ctrl+V
-          const selection = window.getSelection();
-          const range = document.createRange();
-          range.selectNodeContents(el);
-          selection.removeAllRanges();
-          selection.addRange(range);
-          document.execCommand("insertText", false, text);
-        }
-      };
+  const sendCommand = (method, params = {}) => new Promise((resolve) => {
+    chrome.debugger.sendCommand(debuggee, method, params, (res) => {
+      void chrome.runtime.lastError;
+      resolve(res);
+    });
+  });
 
-      const clickArrowSubmit = (boxEl) => {
-        // Находим общий нижний контейнер карточки ввода
-        let container = boxEl.parentElement;
-        for (let d = 0; d < 5 && container; d++) {
-          const r = container.getBoundingClientRect();
-          if (r.width > 350 && r.height > 60) break;
-          container = container.parentElement;
-        }
-        const scope = container || document;
-        const boxRect = boxEl.getBoundingClientRect();
+  try {
+    for (let i = 0; i < prompts.length; i++) {
+      if (await isStopped()) break;
 
-        // Ищем все видимые кнопки в нижней правой части панели ввода
-        const buttons = Array.from(scope.querySelectorAll('button, [role="button"]')).filter(b => {
-          if (b.offsetParent === null || b.disabled || b === boxEl) return false;
-          const r = b.getBoundingClientRect();
-          return r.width >= 20 && r.width <= 60 && r.height >= 20 && r.height <= 60 &&
-                 r.top >= boxRect.top - 10 && r.bottom <= boxRect.bottom + 90 &&
-                 r.left > boxRect.left + boxRect.width * 0.6;
-        });
+      // 1. Вставляем текст промпта в поле и находим точные координаты поля и круглой кнопки со стрелкой
+      const [prepRes] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: (text) => {
+          const candidates = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
+            .filter(el => {
+              const r = el.getBoundingClientRect();
+              return el.offsetParent !== null && r.top > window.innerHeight * 0.45 && r.width > 200;
+            });
+          const box = candidates[candidates.length - 1];
+          if (!box) return { ok: false };
 
-        // Сортируем строго по правому краю: самая правая кнопка — это круглая стрелка отправки
-        buttons.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
-        const arrowBtn = buttons[0];
-
-        if (arrowBtn) {
-          arrowBtn.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
-          arrowBtn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-          arrowBtn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-          arrowBtn.click();
-          return true;
-        }
-        return false;
-      };
-
-      for (let i = 0; i < promptList.length; i++) {
-        if (await isStopped()) return;
-
-        const box = findPromptBox();
-        if (!box) {
-          await setStatus("Ошибка: не найдено нижнее поле ввода промпта в Google Flow.");
-          await chrome.storage.local.set({ flowRunning: false });
-          return;
-        }
-
-        // 1. Вставляем текст и даём React 1.2 секунды на обновление состояния кнопки
-        insertPromptText(box, promptList[i]);
-        await sleep(1200);
-
-        // 2. Нажимаем самую правую круглую кнопку со стрелкой
-        const clicked = clickArrowSubmit(box);
-
-        // 3. Если вдруг поле не очистилось через 800 мс — дожимаем чистым Enter
-        await sleep(800);
-        const currentVal = (box.value !== undefined ? box.value : box.textContent) || "";
-        if (currentVal.trim().length > 0) {
+          box.click();
           box.focus();
-          box.dispatchEvent(new KeyboardEvent("keydown", {
-            key: "Enter", code: "Enter", keyCode: 13, which: 13, shiftKey: false, bubbles: true, cancelable: true
-          }));
-        }
 
-        const currentNum = i + 1;
-        const isEndOfBatch = currentNum % batch === 0 && currentNum < promptList.length;
+          if (box.tagName === "TEXTAREA" || box.tagName === "INPUT") {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+            if (setter) setter.call(box, text);
+            else box.value = text;
+            box.dispatchEvent(new Event("input", { bubbles: true }));
+          } else {
+            const sel = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(box);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand("insertText", false, text);
+          }
 
-        if (isEndOfBatch) {
-          let restSec = restMin * 60;
-          while (restSec > 0) {
-            if (await isStopped()) return;
-            const mins = Math.floor(restSec / 60);
-            const secs = String(restSec % 60).padStart(2, "0");
-            await setStatus(`Готово ${currentNum}/${promptList.length}. Отдых перед следующей пачкой: ${mins}:${secs}...`);
-            await sleep(1000);
-            restSec--;
+          const boxRect = box.getBoundingClientRect();
+          // Находим родительскую карточку нижней панели
+          let container = box.parentElement;
+          for (let d = 0; d < 6 && container; d++) {
+            const r = container.getBoundingClientRect();
+            if (r.width > 350 && r.height > 70) break;
+            container = container.parentElement;
           }
-        } else if (currentNum < promptList.length) {
-          for (let s = genSec; s > 0; s--) {
-            if (await isStopped()) return;
-            await setStatus(`Отправлен ${currentNum}/${promptList.length}. Жду рендер (${s} сек)...`);
-            await sleep(1000);
-          }
-        }
+          const scope = container || document;
+
+          // Находим самую правую круглую кнопку со стрелкой внутри панели ввода
+          const btns = Array.from(scope.querySelectorAll('button, [role="button"]')).filter(b => {
+            if (b.offsetParent === null || b === box) return false;
+            const r = b.getBoundingClientRect();
+            return r.width >= 24 && r.width <= 55 && r.height >= 24 && r.height <= 55 &&
+                   r.top >= boxRect.top && r.bottom <= boxRect.bottom + 95 &&
+                   r.left > boxRect.left + boxRect.width * 0.65;
+          });
+          btns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+          const arrowBtn = btns[0];
+
+          const arrowRect = arrowBtn ? arrowBtn.getBoundingClientRect() : null;
+          return {
+            ok: true,
+            boxX: Math.round(boxRect.left + 40),
+            boxY: Math.round(boxRect.top + 15),
+            btnX: arrowRect ? Math.round(arrowRect.left + arrowRect.width / 2) : null,
+            btnY: arrowRect ? Math.round(arrowRect.top + arrowRect.height / 2) : null
+          };
+        },
+        args: [prompts[i]]
+      });
+
+      const info = prepRes?.result;
+      if (!info || !info.ok) {
+        await setStatus("Ошибка: не найдено поле ввода промпта на странице Google Flow.");
+        break;
       }
 
-      await setStatus(`Готово! Все ${promptList.length} промптов отправлены в Google Flow.`);
-      await chrome.storage.local.set({ flowRunning: false });
-    },
-    args: [prompts, batchSize, restMinutes, genSeconds]
-  });
+      await sleep(800);
+
+      // 2. Делаем НАСТОЯЩИЙ клик мыши по круглой кнопке со стрелкой (или нажимаем настоящий Enter)
+      if (info.btnX && info.btnY) {
+        await sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.btnX, y: info.btnY });
+        await sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x: info.btnX, y: info.btnY, button: "left", clickCount: 1 });
+        await sleep(80);
+        await sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.btnX, y: info.btnY, button: "left", clickCount: 1 });
+      } else {
+        await sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x: info.boxX, y: info.boxY, button: "left", clickCount: 1 });
+        await sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.boxX, y: info.boxY, button: "left", clickCount: 1 });
+        await sleep(150);
+        await sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+        await sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+      }
+
+      const currentNum = i + 1;
+      const isEndOfBatch = currentNum % batchSize === 0 && currentNum < prompts.length;
+
+      if (isEndOfBatch) {
+        let restSec = restMinutes * 60;
+        while (restSec > 0) {
+          if (await isStopped()) break;
+          const mins = Math.floor(restSec / 60);
+          const secs = String(restSec % 60).padStart(2, "0");
+          await setStatus(`Готово ${currentNum}/${prompts.length}. Отдых перед следующей пачкой: ${mins}:${secs}...`);
+          await sleep(1000);
+          restSec--;
+        }
+      } else if (currentNum < prompts.length) {
+        for (let s = genSeconds; s > 0; s--) {
+          if (await isStopped()) break;
+          await setStatus(`Отправлен ${currentNum}/${prompts.length}. Жду рендер (${s} сек)...`);
+          await sleep(1000);
+        }
+      }
+    }
+
+    if (!(await isStopped())) {
+      await setStatus(`Готово! Все ${prompts.length} промптов отправлены в Google Flow.`);
+    }
+  } finally {
+    await chrome.storage.local.set({ flowRunning: false });
+    chrome.debugger.detach(debuggee, () => void chrome.runtime.lastError);
+    runBtn.disabled = false;
+  }
 });
