@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 350px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 14px; margin: 0; background: #fafafa; }
+    h3 { margin: 0 0 8px 0; font-size: 15px; color: #222; }
+    label { display: block; font-size: 12px; color: #555; margin-bottom: 4px; }
+    textarea { width: 100%; height: 140px; box-sizing: border-box; margin-bottom: 10px; padding: 8px; border: 1px solid #ccc; border-radius: 5px; font-size: 12px; resize: vertical; }
+    .settings-row { display: flex; gap: 8px; margin-bottom: 10px; }
+    .setting-box { flex: 1; }
+    input[type="number"] { width: 100%; box-sizing: border-box; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
+    .btn-row { display: flex; gap: 8px; }
+    button { padding: 10px; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 13px; }
+    #runBtn { flex: 2; background: #1a73e8; }
+    #runBtn:hover { background: #1557b0; }
+    #runBtn:disabled { background: #99c2f5; cursor: not-allowed; }
+    #stopBtn { flex: 1; background: #d93025; }
+    #stopBtn:hover { background: #b3261e; }
+    #status { font-size: 12px; color: #333; margin-top: 10px; line-height: 1.4; background: #fff; padding: 8px; border-radius: 4px; border: 1px solid #e5e5e5; }
+  </style>
+</head>
+<body>
+  <h3>Google Flow Auto-Queue</h3>
+  <label for="promptsInput">Список промптов (каждый с новой строки):</label>
+  <textarea id="promptsInput" placeholder="Вставьте сюда 10-30 промптов (каждый с новой строки)..."></textarea>
+
+  <div class="settings-row">
+    <div class="setting-box">
+      <label for="batchSize">Пачка (шт):</label>
+      <input type="number" id="batchSize" value="5" min="1" max="20">
+    </div>
+    <div class="setting-box">
+      <label for="restMinutes">Отдых (мин):</label>
+      <input type="number" id="restMinutes" value="5" min="1" max="30">
+    </div>
+    <div class="setting-box">
+      <label for="genSeconds">Рендер (сек):</label>
+      <input type="number" id="genSeconds" value="22" min="10" max="90">
+    </div>
+  </div>
+
+  <div class="btn-row">
+    <button id="runBtn">Запустить очередь</button>
+    <button id="stopBtn">Остановить</button>
+  </div>
+  <div id="status">Откройте вкладку Google Flow, вставьте промпты и нажмите «Запустить очередь».</div>
+  <script src="popup.js"></script>
+</body>
+</html>
