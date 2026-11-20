@@ -28,7 +28,7 @@ stopBtn.addEventListener("click", () => {
 
 runBtn.addEventListener("click", async () => {
   const rawText = promptsInput.value;
-  // Убираем случайные номера в начале строк вроде "1," или "2."
+  // Убираем номера в начале строк ("1,", "2." и т.д.)
   const prompts = rawText
     .split(/\r?\n/)
     .map(line => line.replace(/^\s*\d+\s*[,.)\-:]\s*/, "").trim())
@@ -41,7 +41,7 @@ runBtn.addEventListener("click", async () => {
 
   const batchSize = Math.max(1, parseInt(batchSizeInput.value, 10) || 5);
   const restMinutes = Math.max(1, parseInt(restMinutesInput.value, 10) || 5);
-  const genSeconds = Math.max(10, parseInt(genSecondsInput.value, 10) || 25);
+  const genSeconds = Math.max(12, parseInt(genSecondsInput.value, 10) || 25);
 
   await chrome.storage.local.set({
     flowPrompts: rawText,
@@ -75,7 +75,6 @@ runBtn.addEventListener("click", async () => {
       };
 
       const findPromptBox = () => {
-        // Ищем нижнее поле ввода промпта (не верхнюю строку поиска по библиотеке)
         const candidates = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
           .filter(el => {
             const r = el.getBoundingClientRect();
@@ -85,6 +84,7 @@ runBtn.addEventListener("click", async () => {
       };
 
       const insertPromptText = (el, text) => {
+        el.click();
         el.focus();
         if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
           const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
@@ -93,25 +93,48 @@ runBtn.addEventListener("click", async () => {
           el.dispatchEvent(new Event("input", { bubbles: true }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
         } else {
-          document.execCommand("selectAll", false, null);
-          document.execCommand("delete", false, null);
+          // Выделяем существующий текст и вставляем новый как при Ctrl+V
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          selection.removeAllRanges();
+          selection.addRange(range);
           document.execCommand("insertText", false, text);
-          el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
         }
       };
 
-      const findSubmitButton = (boxEl) => {
+      const clickArrowSubmit = (boxEl) => {
+        // Находим общий нижний контейнер карточки ввода
+        let container = boxEl.parentElement;
+        for (let d = 0; d < 5 && container; d++) {
+          const r = container.getBoundingClientRect();
+          if (r.width > 350 && r.height > 60) break;
+          container = container.parentElement;
+        }
+        const scope = container || document;
         const boxRect = boxEl.getBoundingClientRect();
-        // Ищем кнопки внутри или вплотную к нижней панели ввода (справа внизу от текста)
-        const allButtons = Array.from(document.querySelectorAll("button")).filter(b => {
-          if (b.offsetParent === null || b.disabled) return false;
+
+        // Ищем все видимые кнопки в нижней правой части панели ввода
+        const buttons = Array.from(scope.querySelectorAll('button, [role="button"]')).filter(b => {
+          if (b.offsetParent === null || b.disabled || b === boxEl) return false;
           const r = b.getBoundingClientRect();
-          return r.top >= boxRect.top - 20 && r.bottom <= boxRect.bottom + 80 && r.left > boxRect.left + boxRect.width * 0.5;
+          return r.width >= 20 && r.width <= 60 && r.height >= 20 && r.height <= 60 &&
+                 r.top >= boxRect.top - 10 && r.bottom <= boxRect.bottom + 90 &&
+                 r.left > boxRect.left + boxRect.width * 0.6;
         });
 
-        // Приоритет: самая правая кнопка в нижней панели (круглая кнопка со стрелкой отправки)
-        allButtons.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
-        return allButtons[0] || null;
+        // Сортируем строго по правому краю: самая правая кнопка — это круглая стрелка отправки
+        buttons.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+        const arrowBtn = buttons[0];
+
+        if (arrowBtn) {
+          arrowBtn.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+          arrowBtn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+          arrowBtn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+          arrowBtn.click();
+          return true;
+        }
+        return false;
       };
 
       for (let i = 0; i < promptList.length; i++) {
@@ -124,28 +147,21 @@ runBtn.addEventListener("click", async () => {
           return;
         }
 
-        // Ждём, если предыдущая генерация ещё блокирует отправку
-        for (let w = 0; w < 15; w++) {
-          if (await isStopped()) return;
-          insertPromptText(box, promptList[i]);
-          await sleep(400);
-          const btn = findSubmitButton(box);
-          if (btn && !btn.disabled) {
-            btn.click();
-            await sleep(500);
-            // Проверяем, очистилось ли поле ввода (значит, Flow принял запрос)
-            const currentVal = (box.value !== undefined ? box.value : box.textContent) || "";
-            if (currentVal.trim().length === 0) {
-              break;
-            }
-          }
-          // Запасной вариант — Enter
-          box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-          await sleep(1500);
-          const afterEnterVal = (box.value !== undefined ? box.value : box.textContent) || "";
-          if (afterEnterVal.trim().length === 0) {
-            break;
-          }
+        // 1. Вставляем текст и даём React 1.2 секунды на обновление состояния кнопки
+        insertPromptText(box, promptList[i]);
+        await sleep(1200);
+
+        // 2. Нажимаем самую правую круглую кнопку со стрелкой
+        const clicked = clickArrowSubmit(box);
+
+        // 3. Если вдруг поле не очистилось через 800 мс — дожимаем чистым Enter
+        await sleep(800);
+        const currentVal = (box.value !== undefined ? box.value : box.textContent) || "";
+        if (currentVal.trim().length > 0) {
+          box.focus();
+          box.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Enter", code: "Enter", keyCode: 13, which: 13, shiftKey: false, bubbles: true, cancelable: true
+          }));
         }
 
         const currentNum = i + 1;
